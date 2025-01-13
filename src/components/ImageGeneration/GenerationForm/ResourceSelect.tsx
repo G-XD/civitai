@@ -1,28 +1,38 @@
 import { Button, ButtonProps, Input, InputWrapperProps } from '@mantine/core';
 import { IconPlus } from '@tabler/icons-react';
 import React, { useEffect } from 'react';
+import { openResourceSelectModal } from '~/components/Dialog/dialog-registry';
+import {
+  ResourceSelectOptions,
+  ResourceSelectSource,
+} from '~/components/ImageGeneration/GenerationForm/resource-select.types';
 import { ResourceSelectCard } from '~/components/ImageGeneration/GenerationForm/ResourceSelectCard';
-import { openResourceSelectModal } from '~/components/ImageGeneration/GenerationForm/ResourceSelectModal';
-import { ResourceSelectOptions } from '~/components/ImageGeneration/GenerationForm/resource-select.types';
 import { withController } from '~/libs/form/hoc/withController';
 import { Generation } from '~/server/services/generation/generation.types';
 
-function ResourceSelect({
+export const ResourceSelect = ({
   value,
   onChange,
   buttonLabel,
+  modalTitle,
   buttonProps,
   options = {},
   allowRemove = true,
+  selectSource = 'generation',
+  disabled,
+  hideVersion,
   ...inputWrapperProps
 }: {
   value?: Generation.Resource;
   onChange?: (value?: Generation.Resource) => void;
   buttonLabel: React.ReactNode;
+  modalTitle?: React.ReactNode;
   buttonProps?: Omit<ButtonProps, 'onClick'>;
   options?: ResourceSelectOptions;
   allowRemove?: boolean;
-} & Omit<InputWrapperProps, 'children'>) {
+  selectSource?: ResourceSelectSource;
+  hideVersion?: boolean;
+} & Omit<InputWrapperProps, 'children'> & { disabled?: boolean }) => {
   const types = options.resources?.map((x) => x.type);
   const _value = types && value && !types.includes(value.modelType) ? undefined : value;
 
@@ -40,9 +50,10 @@ function ResourceSelect({
 
   const handleOpenResourceSearch = () => {
     openResourceSelectModal({
-      title: buttonLabel,
+      title: modalTitle ?? buttonLabel,
       onSelect: handleAdd,
       options,
+      selectSource,
     });
   };
 
@@ -60,6 +71,7 @@ function ResourceSelect({
             leftIcon={<IconPlus size={18} />}
             fullWidth
             onClick={handleOpenResourceSearch}
+            disabled={disabled}
             {...buttonProps}
           >
             {buttonLabel}
@@ -68,14 +80,16 @@ function ResourceSelect({
       ) : (
         <ResourceSelectCard
           resource={value}
+          selectSource={selectSource}
           onUpdate={handleUpdate}
           onRemove={allowRemove ? handleRemove : undefined}
           onSwap={handleOpenResourceSearch}
+          hideVersion={hideVersion}
         />
       )}
     </Input.Wrapper>
   );
-}
+};
 
 const InputResourceSelect = withController(ResourceSelect, ({ field }) => ({
   value: field.value,

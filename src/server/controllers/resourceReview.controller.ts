@@ -5,7 +5,11 @@ import {
   UpdateResourceReviewInput,
   UpsertResourceReviewInput,
 } from '../schema/resourceReview.schema';
-import { throwBadRequestError, throwDbError } from '~/server/utils/errorHandling';
+import {
+  throwAuthorizationError,
+  throwBadRequestError,
+  throwDbError,
+} from '~/server/utils/errorHandling';
 import {
   deleteResourceReview,
   upsertResourceReview,
@@ -18,6 +22,8 @@ import {
 import { Context } from '~/server/createContext';
 import { GetByUsernameSchema } from '~/server/schema/user.schema';
 import { dbRead } from '~/server/db/client';
+import { hasEntityAccess } from '../services/common.service';
+import { redis } from '~/server/redis/client';
 
 export const upsertResourceReviewHandler = async ({
   input,
@@ -27,6 +33,17 @@ export const upsertResourceReviewHandler = async ({
   ctx: DeepNonNullable<Context>;
 }) => {
   try {
+    const [access] = await hasEntityAccess({
+      entityType: 'ModelVersion',
+      entityIds: [input.modelVersionId],
+      userId: ctx.user.id,
+      isModerator: ctx.user.isModerator,
+    });
+
+    if (!access?.hasAccess) {
+      throw throwAuthorizationError('You do not have access to this model version.');
+    }
+
     return await upsertResourceReview({ ...input, userId: ctx.user.id });
   } catch (error) {
     throw throwDbError(error);
@@ -41,14 +58,26 @@ export const createResourceReviewHandler = async ({
   ctx: DeepNonNullable<Context>;
 }) => {
   try {
+    const [access] = await hasEntityAccess({
+      entityType: 'ModelVersion',
+      entityIds: [input.modelVersionId],
+      userId: ctx.user.id,
+      isModerator: ctx.user.isModerator,
+    });
+
+    if (!access?.hasAccess) {
+      throw throwAuthorizationError('You do not have access to this model version.');
+    }
+
     const result = await createResourceReview({ ...input, userId: ctx.user.id });
     await ctx.track.resourceReview({
       type: 'Create',
       modelId: result.modelId,
-      modelVersionId: result.modelVersion.id,
-      rating: result.rating,
-      nsfw: result.nsfw,
+      modelVersionId: result.modelVersionId,
+      rating: result.recommended ? 5 : 1,
+      nsfw: false,
     });
+    await redis.del(`user:${ctx.user.id}:model-engagements`);
     return result;
   } catch (error) {
     throw throwDbError(error);
@@ -71,7 +100,7 @@ export const updateResourceReviewHandler = async ({
       rating: result.rating,
       nsfw: result.nsfw,
     });
-
+    await redis.del(`user:${ctx.user.id}:model-engagements`);
     return result;
   } catch (error) {
     throw throwDbError(error);

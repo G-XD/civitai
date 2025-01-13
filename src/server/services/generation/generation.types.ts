@@ -1,4 +1,5 @@
-import { ModelType } from '@prisma/client';
+import { ModelType } from '~/shared/utils/prisma/enums';
+import { GenerationRequestStatus } from '~/server/common/enums';
 
 export namespace Generation {
   export type AdditionalNetwork = Partial<{
@@ -7,6 +8,7 @@ export namespace Generation {
     maxStrength: number;
   }>;
 
+  export type ImageStatus = 'Success' | 'Started' | 'Error' | 'RemovedForSafety' | 'Cancelled';
   export type Image = {
     id: number;
     hash: string;
@@ -14,7 +16,11 @@ export namespace Generation {
     available: boolean;
     requestId: number;
     seed?: number; // TODO.generation - check if this prop will be set
-    status?: 'Success' | 'Started' | 'Error';
+    status?: ImageStatus;
+    type?: any;
+    removedForSafety: boolean;
+    jobToken?: string;
+    duration?: number | null;
   };
 
   export type Data = {
@@ -27,12 +33,13 @@ export namespace Generation {
     negativePrompt?: string;
     width: number;
     height: number;
-    sampler: string;
+    sampler?: string;
     steps: number;
     cfgScale: number;
     seed?: number;
     clipSkip: number;
     baseModel?: string;
+    scheduler?: string;
   };
 
   export type Asset = {
@@ -58,6 +65,10 @@ export namespace Generation {
     modelName: string;
     modelType: ModelType;
     baseModel: string;
+    strength?: number;
+    minStrength?: number;
+    maxStrength?: number;
+    minor?: boolean;
 
     // navigation props
     covered?: boolean;
@@ -78,15 +89,18 @@ export namespace Generation {
 
   export type Request = {
     id: number;
+    // alternativesAvailable?: boolean;
     createdAt: Date;
-    estimatedCompletionDate: Date;
+    // estimatedCompletionDate: Date;
     status: GenerationRequestStatus;
     quantity: number;
     priority: number;
     params: Params;
     resources: Resource[];
     images?: Image[];
-    queuePosition?: QueuePosition;
+    // queuePosition?: QueuePosition;
+    cost?: number;
+    sequential?: boolean;
   };
 
   export type Coverage = {
@@ -118,18 +132,11 @@ export namespace Generation {
       job: Job;
       images?: Image[];
       queuePosition?: QueuePosition;
+      cost: number;
     };
     export type Request = {
       cursor: number;
       requests: RequestProps[];
     };
   }
-}
-
-export enum GenerationRequestStatus {
-  Pending = 'Pending',
-  Processing = 'Processing',
-  Cancelled = 'Cancelled',
-  Error = 'Error',
-  Succeeded = 'Succeeded',
 }

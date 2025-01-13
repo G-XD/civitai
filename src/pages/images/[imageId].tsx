@@ -1,23 +1,11 @@
 import { createServerSideProps } from '~/server/utils/server-side-helpers';
 import { isNumber } from '~/utils/type-guards';
-import { ImageDetail } from '~/components/Image/Detail/ImageDetail';
 import { ImageDetailProvider } from '~/components/Image/Detail/ImageDetailProvider';
 import { imagesQueryParamSchema } from '~/components/Image/image.utils';
 import { useBrowserRouter } from '~/components/BrowserRouter/BrowserRouterProvider';
-
-export default function ImagePage() {
-  const router = useBrowserRouter();
-  const imageId = router.query.imageId;
-  const filters = imagesQueryParamSchema.parse(router.query);
-
-  if (!imageId) return null;
-
-  return (
-    <ImageDetailProvider imageId={imageId} filters={filters}>
-      <ImageDetail />
-    </ImageDetailProvider>
-  );
-}
+import { NotFound } from '~/components/AppLayout/NotFound';
+import { ImageDetail2 } from '~/components/Image/DetailV2/ImageDetail2';
+import { Page } from '~/components/AppLayout/Page';
 
 export const getServerSideProps = createServerSideProps({
   useSSG: true,
@@ -27,7 +15,24 @@ export const getServerSideProps = createServerSideProps({
     if (!isNumber(id)) return { notFound: true };
 
     await ssg?.image.get.prefetch({ id });
+    await ssg?.image.getContestCollectionDetails.prefetch({ id });
+    await ssg?.hiddenPreferences.getHidden.prefetch();
   },
 });
 
-ImagePage.getLayout = (page: React.ReactElement) => <>{page}</>;
+export default Page(
+  function () {
+    const router = useBrowserRouter();
+    const imageId = router.query.imageId;
+    const filters = imagesQueryParamSchema.parse(router.query);
+
+    if (!imageId) return <NotFound />;
+
+    return (
+      <ImageDetailProvider imageId={imageId} filters={filters}>
+        <ImageDetail2 />
+      </ImageDetailProvider>
+    );
+  },
+  { getLayout: (page) => <main className="size-full">{page}</main> }
+);

@@ -1,10 +1,10 @@
 import { Badge, BadgeProps, Tooltip } from '@mantine/core';
-import { NextLink } from '@mantine/next';
+import { NextLink as Link } from '~/components/NextLink/NextLink';
 
 export function IconBadge({ icon, children, tooltip, href, ...props }: IconBadgeProps) {
   const badge = href ? (
     <Badge
-      component={NextLink}
+      component={Link}
       href={href}
       styles={{
         leftSection: { marginRight: 4 },
@@ -42,7 +42,7 @@ export function IconBadge({ icon, children, tooltip, href, ...props }: IconBadge
 }
 
 export type IconBadgeProps = {
-  icon: React.ReactNode;
+  icon?: React.ReactNode;
   tooltip?: React.ReactNode;
   onClick?: React.MouseEventHandler<any> | undefined; //eslint-disable-line
   href?: string;

@@ -1,23 +1,40 @@
-import { ModelStatus } from '@prisma/client';
+import { ModelStatus } from '~/shared/utils/prisma/enums';
 import { TRPCError } from '@trpc/server';
-
-import { BaseModel, BaseModelType } from '~/server/common/constants';
+import { BaseModel, baseModelLicenses, BaseModelType, constants } from '~/server/common/constants';
 import { Context } from '~/server/createContext';
+import { eventEngine } from '~/server/events';
+import { dataForModelsCache } from '~/server/redis/caches';
 import { GetByIdInput } from '~/server/schema/base.schema';
 import {
+  EarlyAccessModelVersionsOnTimeframeSchema,
   GetModelVersionSchema,
+  ModelVersionEarlyAccessConfig,
+  ModelVersionEarlyAccessPurchase,
   ModelVersionMeta,
+  ModelVersionsGeneratedImagesOnTimeframeSchema,
   ModelVersionUpsertInput,
   PublishVersionInput,
+  QueryModelVersionSchema,
   RecommendedSettingsSchema,
+  TrainingDetailsObj,
 } from '~/server/schema/model-version.schema';
-import { DeclineReviewSchema, ModelMeta, UnpublishModelSchema } from '~/server/schema/model.schema';
+import { DeclineReviewSchema, UnpublishModelSchema } from '~/server/schema/model.schema';
 import { ModelFileModel } from '~/server/selectors/modelFile.selector';
+import { userWithCosmeticsSelect } from '~/server/selectors/user.selector';
+import { getStaticContent } from '~/server/services/content.service';
+import { getUnavailableResources } from '~/server/services/generation/generation.service';
 import {
+  addAdditionalLicensePermissions,
   deleteVersionById,
+  earlyAccessModelVersionsOnTimeframe,
+  earlyAccessPurchase,
   getModelVersionRunStrategies,
+  getUserEarlyAccessModelVersions,
   getVersionById,
+  modelVersionDonationGoals,
+  modelVersionGeneratedImagesOnTimeframe,
   publishModelVersionById,
+  queryModelVersions,
   toggleNotifyModelVersion,
   unpublishModelVersionById,
   upsertModelVersion,
@@ -25,13 +42,21 @@ import {
 import { getModel, updateModelEarlyAccessDeadline } from '~/server/services/model.service';
 import { trackModActivity } from '~/server/services/moderator.service';
 import {
+  getMaxEarlyAccessDays,
+  getMaxEarlyAccessModels,
+} from '~/server/utils/early-access-helpers';
+import {
   handleLogError,
   throwAuthorizationError,
   throwBadRequestError,
   throwDbError,
   throwNotFoundError,
 } from '~/server/utils/errorHandling';
+import { dbRead } from '../db/client';
 import { modelFileSelect } from '../selectors/modelFile.selector';
+import { getFilesByEntity } from '../services/file.service';
+import { createFile } from '../services/model-file.service';
+import { TrainingResultsV2 } from '~/server/schema/model-file.schema';
 
 export const getModelVersionRunStrategiesHandler = ({ input: { id } }: { input: GetByIdInput }) => {
   try {
@@ -41,6 +66,7 @@ export const getModelVersionRunStrategiesHandler = ({ input: { id } }: { input: 
   }
 };
 
+export type ModelVersionById = AsyncReturnType<typeof getModelVersionHandler>;
 export const getModelVersionHandler = async ({ input }: { input: GetModelVersionSchema }) => {
   const { id, withFiles } = input;
 
@@ -53,7 +79,8 @@ export const getModelVersionHandler = async ({ input }: { input: GetModelVersion
         description: true,
         baseModel: true,
         baseModelType: true,
-        earlyAccessTimeFrame: true,
+        earlyAccessConfig: true,
+        earlyAccessEndsAt: true,
         trainedWords: true,
         epochs: true,
         steps: true,
@@ -61,6 +88,9 @@ export const getModelVersionHandler = async ({ input }: { input: GetModelVersion
         status: true,
         createdAt: true,
         vaeId: true,
+        trainingDetails: true,
+        trainingStatus: true,
+        uploadType: true,
         model: {
           select: {
             id: true,
@@ -68,11 +98,13 @@ export const getModelVersionHandler = async ({ input }: { input: GetModelVersion
             type: true,
             status: true,
             publishedAt: true,
+            nsfw: true,
+            uploadType: true,
             user: { select: { id: true } },
           },
         },
         files: withFiles ? { select: modelFileSelect } : false,
-        posts: withFiles ? { select: { id: true } } : false,
+        posts: withFiles ? { select: { id: true, userId: true } } : false,
         requireAuth: true,
         settings: true,
         recommendedResources: {
@@ -106,14 +138,23 @@ export const getModelVersionHandler = async ({ input }: { input: GetModelVersion
             },
           },
         },
+        generationCoverage: { select: { covered: true } },
       },
     });
+
     if (!version) throw throwNotFoundError(`No version with id ${input.id}`);
+
+    const unavailableGenResources = await getUnavailableResources();
+    const canGenerate =
+      !!version.generationCoverage?.covered && !unavailableGenResources.includes(version.id);
 
     return {
       ...version,
+      canGenerate,
+      earlyAccessConfig: version.earlyAccessConfig as ModelVersionEarlyAccessConfig | null,
       baseModel: version.baseModel as BaseModel,
       baseModelType: version.baseModelType as BaseModelType,
+      trainingDetails: version.trainingDetails as TrainingDetailsObj | undefined,
       files: version.files as unknown as Array<
         Omit<ModelFileModel, 'metadata'> & { metadata: FileMetadata }
       >,
@@ -155,20 +196,46 @@ export const toggleNotifyEarlyAccessHandler = async ({
 };
 
 export const upsertModelVersionHandler = async ({
-  input,
+  input: { bountyId, ...input },
   ctx,
 }: {
   input: ModelVersionUpsertInput;
   ctx: DeepNonNullable<Context>;
 }) => {
   try {
+    const { id: userId } = ctx.user;
+
     if (input.trainingDetails === null) {
       input.trainingDetails = undefined;
     }
+
+    if (!!input.earlyAccessConfig?.timeframe) {
+      const maxDays = getMaxEarlyAccessDays({ userMeta: ctx.user.meta });
+
+      if (input.earlyAccessConfig?.timeframe > maxDays) {
+        throw throwBadRequestError('Early access days exceeds user limit');
+      }
+    }
+
+    if (input?.earlyAccessConfig?.timeframe) {
+      // Confirm the user doesn't have any other early access models that are still active.
+      const activeEarlyAccess = await getUserEarlyAccessModelVersions({ userId: ctx.user.id });
+
+      if (
+        activeEarlyAccess.length >= getMaxEarlyAccessModels({ userMeta: ctx.user.meta }) &&
+        (!input.id || !activeEarlyAccess.some((v) => v.id === input.id))
+      ) {
+        throw throwBadRequestError(
+          'Sorry, you have exceeded the maximum number of early access models you can have at the time.'
+        );
+      }
+    }
+
     const version = await upsertModelVersion({
       ...input,
       trainingDetails: input.trainingDetails,
     });
+
     if (!version) throw throwNotFoundError(`No model version with id ${input.id}`);
 
     // Just update early access deadline if updating the model version
@@ -194,7 +261,47 @@ export const upsertModelVersionHandler = async ({
           nsfw: model.nsfw,
         });
       }
+
+      if (bountyId) {
+        // Create model version files from the bounty.
+        const awardedEntry = await dbRead.bountyEntry.findFirst({
+          where: { bountyId, benefactors: { some: { userId } } },
+          select: { id: true, bounty: true },
+        });
+
+        if (
+          awardedEntry &&
+          constants.bounties.supportedBountyToModels.some((t) => t === awardedEntry?.bounty.type)
+        ) {
+          const files = await getFilesByEntity({ id: awardedEntry.id, type: 'BountyEntry' });
+
+          if (files.length) {
+            await Promise.all(
+              files.map((f) =>
+                createFile({
+                  modelVersionId: version.id,
+                  sizeKB: f.sizeKB,
+                  url: f.url,
+                  type: 'Model',
+                  metadata: {
+                    ...f.metadata,
+                    bountyId: awardedEntry.bounty.id,
+                    bountyEntryId: awardedEntry.id,
+                  },
+                  userId: ctx.user.id,
+                  name: f.name,
+                  select: {
+                    id: true,
+                  },
+                })
+              )
+            );
+          }
+        }
+      }
     }
+
+    await dataForModelsCache.bust(version.modelId);
 
     return version;
   } catch (error) {
@@ -213,6 +320,8 @@ export const deleteModelVersionHandler = async ({ input }: { input: GetByIdInput
       console.error(e);
     });
 
+    await dataForModelsCache.bust(version.modelId);
+
     return version;
   } catch (error) {
     if (error instanceof TRPCError) throw error;
@@ -228,12 +337,29 @@ export const publishModelVersionHandler = async ({
   ctx: DeepNonNullable<Context>;
 }) => {
   try {
-    const version = await getVersionById({ id: input.id, select: { meta: true } });
+    const version = await getVersionById({
+      id: input.id,
+      select: {
+        meta: true,
+        status: true,
+        modelId: true,
+        earlyAccessConfig: true,
+        model: { select: { userId: true } },
+      },
+    });
+
     if (!version) throw throwNotFoundError(`No model version with id ${input.id}`);
 
+    const versionMeta = version.meta as ModelVersionMeta | null;
+    const republishing =
+      version.status !== ModelStatus.Draft && version.status !== ModelStatus.Scheduled;
     const { needsReview, unpublishedReason, unpublishedAt, customMessage, ...meta } =
-      (version.meta as ModelMeta | null) || {};
-    const updatedVersion = await publishModelVersionById({ ...input, meta });
+      versionMeta || {};
+    const updatedVersion = await publishModelVersionById({
+      ...input,
+      meta,
+      republishing,
+    });
 
     await updateModelEarlyAccessDeadline({ id: updatedVersion.modelId }).catch((e) => {
       console.error('Unable to update model early access deadline');
@@ -249,6 +375,17 @@ export const publishModelVersionHandler = async ({
         nsfw: updatedVersion.model.nsfw,
       })
       .catch(handleLogError);
+
+    if (!input.publishedAt || input.publishedAt <= new Date()) {
+      await eventEngine.processEngagement({
+        userId: updatedVersion.model.userId,
+        type: 'published',
+        entityType: 'modelVersion',
+        entityId: updatedVersion.id,
+      });
+    }
+
+    await dataForModelsCache.bust(version.modelId);
 
     return updatedVersion;
   } catch (error) {
@@ -266,10 +403,10 @@ export const unpublishModelVersionHandler = async ({
 }) => {
   try {
     const { id } = input;
-    const modelVersion = await getVersionById({ id, select: { meta: true } });
-    if (!modelVersion) throw throwNotFoundError(`No model version with id ${input.id}`);
+    const version = await getVersionById({ id, select: { meta: true, modelId: true } });
+    if (!version) throw throwNotFoundError(`No model version with id ${input.id}`);
 
-    const meta = (modelVersion.meta as ModelVersionMeta | null) || {};
+    const meta = (version.meta as ModelVersionMeta | null) || {};
     const updatedVersion = await unpublishModelVersionById({ ...input, meta, user: ctx.user });
 
     // Send event in background
@@ -279,6 +416,8 @@ export const unpublishModelVersionHandler = async ({
       modelId: updatedVersion.model.id,
       nsfw: updatedVersion.model.nsfw,
     });
+
+    await dataForModelsCache.bust(version.modelId);
 
     return updatedVersion;
   } catch (error) {
@@ -373,3 +512,208 @@ export const declineReviewHandler = async ({
     else throw throwDbError(error);
   }
 };
+
+export const earlyAccessModelVersionsOnTimeframeHandler = async ({
+  input,
+  ctx,
+}: {
+  input: EarlyAccessModelVersionsOnTimeframeSchema;
+  ctx: DeepNonNullable<Context>;
+}) => {
+  try {
+    return earlyAccessModelVersionsOnTimeframe({
+      ...input,
+      userId: ctx.user.id,
+    });
+  } catch (error) {
+    if (error instanceof TRPCError) error;
+    else throw throwDbError(error);
+  }
+};
+
+export const modelVersionGeneratedImagesOnTimeframeHandler = async ({
+  input,
+  ctx,
+}: {
+  input: ModelVersionsGeneratedImagesOnTimeframeSchema;
+  ctx: DeepNonNullable<Context>;
+}) => {
+  try {
+    return modelVersionGeneratedImagesOnTimeframe({
+      ...input,
+      userId: ctx.user.id,
+    });
+  } catch (error) {
+    if (error instanceof TRPCError) error;
+    else throw throwDbError(error);
+  }
+};
+
+// Only available for SD 1.5 and SDXL 1.0 models for now
+export async function getVersionLicenseHandler({ input }: { input: GetByIdInput }) {
+  try {
+    const version = await getVersionById({
+      id: input.id,
+      select: {
+        id: true,
+        name: true,
+        baseModel: true,
+        status: true,
+        model: {
+          select: {
+            id: true,
+            name: true,
+            status: true,
+            allowCommercialUse: true,
+            allowDerivatives: true,
+            allowDifferentLicense: true,
+            allowNoCredit: true,
+            user: { select: { username: true } },
+          },
+        },
+      },
+    });
+    if (!version || version.status !== 'Published' || version.model.status !== 'Published')
+      throw throwNotFoundError(`No version with id ${input.id}`);
+
+    if (!constants.supportedBaseModelAddendums.includes(version.baseModel as 'SD 1.5' | 'SDXL 1.0'))
+      return throwBadRequestError('License not available for this model');
+
+    const hasAdditionalPermissions =
+      !version.model.allowCommercialUse.length ||
+      version.model.allowCommercialUse.some((permission) =>
+        ['None', 'Image', 'RentCivit', 'Rent', 'Sell'].includes(permission)
+      ) ||
+      !version.model.allowNoCredit ||
+      !version.model.allowDerivatives ||
+      version.model.allowDifferentLicense;
+
+    if (!hasAdditionalPermissions) throw throwBadRequestError('No additional permissions');
+
+    const licenseSlug = baseModelLicenses[version.baseModel as BaseModel]?.name ?? '';
+    const license = await getStaticContent({ slug: ['licenses', licenseSlug] });
+
+    license.content = addAdditionalLicensePermissions(license.content, {
+      modelId: version.model.id,
+      modelName: version.model.name,
+      versionId: version.id,
+      username: version.model.user.username,
+      allowCommercialUse: version.model.allowCommercialUse,
+      allowNoCredit: version.model.allowNoCredit,
+      allowDerivatives: version.model.allowDerivatives,
+      allowDifferentLicense: version.model.allowDifferentLicense,
+    });
+
+    return { ...version, license };
+  } catch (error) {
+    if (error instanceof TRPCError) throw error;
+    else throw throwDbError(error);
+  }
+}
+
+export const modelVersionEarlyAccessPurchaseHandler = async ({
+  input,
+  ctx,
+}: {
+  input: ModelVersionEarlyAccessPurchase;
+  ctx: DeepNonNullable<Context>;
+}) => {
+  try {
+    return earlyAccessPurchase({
+      ...input,
+      userId: ctx.user.id,
+    });
+  } catch (error) {
+    if (error instanceof TRPCError) error;
+    else throw throwDbError(error);
+  }
+};
+
+export const modelVersionDonationGoalsHandler = async ({
+  input,
+  ctx,
+}: {
+  input: GetByIdInput;
+  ctx: Context;
+}) => {
+  try {
+    return modelVersionDonationGoals({
+      ...input,
+      userId: ctx.user?.id,
+      isModerator: ctx.user?.isModerator,
+    });
+  } catch (error) {
+    if (error instanceof TRPCError) error;
+    else throw throwDbError(error);
+  }
+};
+
+export async function queryModelVersionsForModeratorHandler({
+  input,
+  ctx,
+}: {
+  input: QueryModelVersionSchema;
+  ctx: Context;
+}) {
+  const { nextCursor, items } = await queryModelVersions({
+    user: ctx.user,
+    query: input,
+    select: {
+      id: true,
+      name: true,
+      meta: true,
+      trainingStatus: true,
+      createdAt: true,
+      model: {
+        select: {
+          id: true,
+          name: true,
+          userId: true,
+        },
+      },
+    },
+  });
+
+  return {
+    nextCursor,
+    items: items as Array<Omit<(typeof items)[number], 'meta'> & { meta: ModelVersionMeta }>,
+  };
+}
+
+export async function getModelVersionOwnerHandler({ input }: { input: GetByIdInput }) {
+  const version = await getVersionById({
+    ...input,
+    select: { model: { select: { user: { select: userWithCosmeticsSelect } } } },
+  });
+  if (!version) throw throwNotFoundError();
+  return version.model.user;
+}
+
+export async function getModelVersionForTrainingReviewHandler({ input }: { input: GetByIdInput }) {
+  const version = await getVersionById({
+    ...input,
+    select: {
+      model: { select: { user: { select: userWithCosmeticsSelect } } },
+      files: {
+        select: {
+          metadata: true,
+        },
+        where: {
+          type: 'Training Data',
+        },
+      },
+    },
+  });
+  if (!version) throw throwNotFoundError();
+
+  const trainingFile = version.files[0];
+  const trainingResults = (trainingFile?.metadata as FileMetadata)
+    ?.trainingResults as TrainingResultsV2;
+
+  return {
+    user: version.model.user,
+    workflowId: trainingResults?.workflowId,
+    jobId: trainingResults?.jobId as string | null,
+    trainingResults,
+  };
+}
